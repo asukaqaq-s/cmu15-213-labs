@@ -19,7 +19,7 @@ int main(int argc, char **argv)
 	    fprintf(stderr, "Usage: %s <n>\n", argv[0]);
 	    exit(0);
     }
-    // printf("split parent pocess\n");
+    
     secs = atoi(argv[1]);
 
     if (fork() == 0) { /* child */
@@ -30,7 +30,8 @@ int main(int argc, char **argv)
     }
 
     /* parent waits for child to terminate */
-    wait(NULL);
-
+    // wait(NULL);
+    while(1);
+    
     exit(0);
 }   
