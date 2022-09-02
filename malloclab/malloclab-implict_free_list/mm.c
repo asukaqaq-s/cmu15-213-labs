@@ -44,7 +44,7 @@ team_t team = {
 #define WSIZE 4
 #define DSIZE 8
 #define CHUNKSIZE (1<<12)
-
+#define DELAY_TIMES 50 
 /********************************************************
 * MICRO_FUNCTIONS
 *********************************************************/
@@ -84,7 +84,6 @@ team_t team = {
 /* local heap_top_pointer */
 char * heap_top;
 char * heap_start;
-
 
 static void print_error() {
     printf("error!!!\n");
@@ -152,6 +151,27 @@ static void* coalesce(void* bp) {
 }
 
 /**
+ * delay_coalesce - merge all nearly blks
+ */
+static void delay_coalesce() {
+    char *now;
+    size_t size;
+    int is_allocated;
+    now = heap_top;
+
+    while(1) {
+        size = GET_SIZE(HDRP(now));
+        is_allocated = GET_ALLOC(HDRP(now));
+        if(!is_allocated) { /* 如果没有分配,就试着合并周围块 */
+            coalesce(now);
+        }   
+        if(size == 0) 
+            break;
+        now = NEXT_BLKP(now);
+    }
+}
+
+/**
  * extend_heap - extend the heap size blks
  * @return 0 if failed,else return new_blk 's start address
  */
@@ -168,7 +188,6 @@ static void* extend_heap(size_t words) {
     PUT(HDRP(bp), PACK(size, 0)); /* new blk header */
     PUT(FTRP(bp), PACK(size, 0)); /* new blk footer */
     PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1)); /* new end blk */
-    
     return coalesce(bp);
 }
 
@@ -190,10 +209,11 @@ static void place(char *bp, size_t asize) {
 }
 
 /**
- * entend_heap - extend the heap size blks
- * @return 0 if failed,else return new_blk 's start address
+ * find_blk_first - find the fit blocks
+ * first fit version
+ * @return 0 if failed,else return fit_blk 's start address
  */
-static void* find_blk(size_t asize) {
+static void* find_blk_first(size_t asize) {
     char *now;
     size_t size;
     int is_allocated;
@@ -212,6 +232,39 @@ static void* find_blk(size_t asize) {
     return NULL;
 }
 
+/**
+ * find_blk_best - find the fit blocks
+ * best fit version
+ * @return 0 if failed,else return fit_blk 's start address
+ */
+
+static void* find_blk_best(size_t asize) {
+    char *now;
+    char *p;
+    size_t size;
+    int is_allocated;
+    int min_blks = 1e9;
+    
+    now = heap_top;
+
+    while(1) {
+        size = GET_SIZE(HDRP(now));
+        is_allocated = GET_ALLOC(HDRP(now));
+        if(size == 0) 
+            break;
+        if(size >= asize && !is_allocated) {
+            if(min_blks > size) {
+                min_blks = size;
+                p = now;
+            }
+        }
+        now = NEXT_BLKP(now);
+    }
+    if(min_blks != 1e9) {
+        return p;
+    }
+    return NULL;
+}
 
 /* 
  * mm_init - initialize the malloc package.
@@ -231,7 +284,7 @@ int mm_init(void) {
     heap_start = heap_top;
 
     if (extend_heap(CHUNKSIZE/WSIZE) == NULL) {
-        printf("init:entend failed\n");
+        printf("init:extend failed\n");
         return -1;
     }
     return 0;
@@ -253,23 +306,18 @@ void *mm_malloc(size_t size) {
         // 要找一个对齐并且是原来 size + 8, 因为一个块浪费两个 word 给header、footer
         asize = DSIZE * ((size + DSIZE + (DSIZE - 1))/(DSIZE));
     }
-    // printf("size = %d, asize = %d\n",size,asize);
-    if((bp = find_blk(asize)) != NULL) { /* success find */
+    if((bp = find_blk_best(asize)) != NULL) { /* success find */
         place(bp, asize);
-        // printf("malloc: find_blk size = %d\n               ",asize);
-        // print_list();
         return bp;
     }
+
     // 分配一个新的块
     entend_size = MAX(asize, CHUNKSIZE);
     if((bp = extend_heap(entend_size/WSIZE)) == NULL) {
         printf("malloc:extend failed\n");
         return NULL;
     }
-    
     place(bp, asize);
-    // printf("malloc: extend size = %d\n               ",asize);
-    // print_list();
     return bp;
 }
 
@@ -281,61 +329,51 @@ void mm_free(void *bp) {
     PUT(HDRP(bp), PACK(size, 0));
     PUT(FTRP(bp), PACK(size, 0));
     coalesce(bp);
-    // printf("free: size = %d\n               ",size);
-    // print_list();
 }
 
 /*
  * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
  */
 void *mm_realloc(void *ptr, size_t size) {
-    void *oldptr = ptr; /* 原来块的原指针 */
-    void *newptr;       /* 原来块的新指针 */
-    void *newblk_ptr;   /* 新块的新指针 */
-    size_t copySize;
-    size_t old_size;
-    size_t new_size;
-    size_t words = size/WSIZE;
-    size_t asize;
-    
-    if(ptr == NULL) {
-        newblk_ptr = mm_malloc(size); 
-        return newblk_ptr;  
-    }
-    else if(size == 0) {
-        mm_free(oldptr);
-        return NULL;
-    }
-    old_size = GET_SIZE(HDRP(ptr));
-    // 1.看看原来的ptr能不能用
-    newptr = coalesce(ptr); /* 合并原来的块 */
-    asize = size <=DSIZE ? 2*DSIZE : DSIZE * ((size + (DSIZE) + (DSIZE-1)) / DSIZE); 
-    
-    if(newptr != oldptr) { /* 如果前面有空闲块,payload前移 */
-        memcpy(newptr, oldptr, old_size - DSIZE);
-    }
-    new_size = GET_SIZE(HDRP(newptr));
+    void *old_bp,*new_bp;
+    size_t new_block_size; /* after free */
+    size_t old_block_size; /* before free */
+    size_t asize; /* align size */
 
-    if(asize <= new_size) { /* 能够满足直接退出 */
-        place(newptr, asize);
-        return newptr;
-    }
-    /* 为了确保free正常,设置为allocated */
-    PUT(HDRP(newptr), PACK(new_size, 1));
-    PUT(FTRP(newptr), PACK(new_size, 1));
+    old_bp = ptr;
+    old_block_size = GET_SIZE(HDRP(ptr));
+
+    // 1. align size
     
-    // 2.如果不能用,需要malloc+free
-    newblk_ptr = mm_malloc(size); /* malloc 里面会让size变成size + 2 */
-    if (newblk_ptr == NULL)
-      return NULL;
+    if(size <= DSIZE) {
+        asize = 2 * DSIZE;
+    } else {
+        asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1))/DSIZE);
+    }
 
-    copySize = GET_SIZE(HDRP(ptr)) - DSIZE;
-    if (size <= copySize)
-      copySize = size;
+    /* 在判断 block_size >= asize 之前,可能周围有其他空闲块
+       因此需要先合并周围空闲块,由于free不会返回一个合并后的指针,所以只调用 coalesce */
+    
+    // 2. coalesce
 
-    memcpy(newblk_ptr, newptr, copySize);
-    mm_free(newptr);
-    return newblk_ptr;
+    new_bp = coalesce(old_bp);
+    new_block_size = GET_SIZE(HDRP(new_bp));
+    
+    if(new_bp != old_bp) { /* 发生了合并 */
+        memcpy(new_bp, old_bp, old_block_size - DSIZE); /* 拷贝原来的内容到new_bp上 */
+    }
+
+    // 3. 后两种情况    
+    if(new_block_size >= asize) {
+        place(new_bp, asize);
+        return new_bp;
+    }
+    
+    // 4. 第一种情况
+    new_bp = mm_malloc(asize);
+    memcpy(new_bp, old_bp, old_block_size - DSIZE); /* 拷贝原来的内容到new_bp上 */
+    mm_free(old_bp);
+    return new_bp;
 }
 
 
